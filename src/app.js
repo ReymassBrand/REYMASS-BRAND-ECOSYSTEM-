@@ -13,6 +13,9 @@ const analyticsRoutes = require('./routes/analyticsRoutes');
 const mpesaRoutes = require('./routes/mpesaRoutes');
 const app = express();
 
+// Trust Railway's reverse proxy for accurate client IP detection.
+app.set('trust proxy', 1);
+
 // 2. Global Security & Parsing Middleware
 app.use(helmet());
 app.use(cors());
