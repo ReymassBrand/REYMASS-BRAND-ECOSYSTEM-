@@ -1,0 +1,36 @@
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs and debugging output
+*.log
+debug-*.txt
+checkMpesaSchema.js
+
+# Backups
+*.backup
+*.backup-*
+*.bak
+*.old
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test and coverage output
+coverage/
+.nyc_output/
+
+# Database backups
+*_backup_*

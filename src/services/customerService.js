@@ -1,0 +1,53 @@
+/**
+ * REYMASS ONE - Customer 360 Routes
+ */
+const express = require('express');
+const router = express.Router();
+const customerController = require('../controllers/customerController');
+const authMiddleware = require('../middleware/authMiddleware');
+
+const authenticate = 
+  typeof authMiddleware === 'function' 
+    ? authMiddleware 
+    : (authMiddleware.authenticateToken || authMiddleware.protect || ((req, res, next) => next()));
+
+// --- Core Customer Management ---
+router.get('/', authenticate, customerController.getCustomers);
+router.post('/', authenticate, customerController.createCustomer);
+
+// --- Central 360 Endpoint ---
+router.get('/:id/360', authenticate, customerController.getCustomer360);
+
+router.get('/:id', authenticate, customerController.getCustomerById);
+router.put('/:id', authenticate, customerController.updateCustomer);
+router.delete('/:id', authenticate, customerController.deactivateCustomer);
+
+// --- Customer Subsidiaries ---
+router.get('/:id/subsidiaries', authenticate, customerController.getCustomerSubsidiaries);
+router.post('/:id/subsidiaries', authenticate, customerController.addCustomerSubsidiary);
+router.delete('/:id/subsidiaries/:subsidiaryId', authenticate, customerController.removeCustomerSubsidiary);
+
+// --- Customer Contacts ---
+router.get('/:id/contacts', authenticate, customerController.getCustomerContacts);
+router.post('/:id/contacts', authenticate, customerController.createCustomerContact);
+router.put('/:id/contacts/:contactId', authenticate, customerController.updateCustomerContact);
+router.delete('/:id/contacts/:contactId', authenticate, customerController.deleteCustomerContact);
+
+// --- Customer Addresses ---
+router.get('/:id/addresses', authenticate, customerController.getCustomerAddresses);
+router.post('/:id/addresses', authenticate, customerController.createCustomerAddress);
+router.put('/:id/addresses/:addressId', authenticate, customerController.updateCustomerAddress);
+router.delete('/:id/addresses/:addressId', authenticate, customerController.deleteCustomerAddress);
+
+// --- Customer Notes ---
+router.get('/:id/notes', authenticate, customerController.getCustomerNotes);
+router.post('/:id/notes', authenticate, customerController.createCustomerNote);
+router.put('/:id/notes/:noteId', authenticate, customerController.updateCustomerNote);
+router.delete('/:id/notes/:noteId', authenticate, customerController.deleteCustomerNote);
+
+// --- Customer Services ---
+router.get('/:id/services', authenticate, customerController.getCustomerServices);
+router.post('/:id/services', authenticate, customerController.createCustomerService);
+router.patch('/:id/services/:serviceId/status', authenticate, customerController.updateCustomerServiceStatus);
+
+module.exports = router;

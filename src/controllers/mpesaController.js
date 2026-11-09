@@ -1,0 +1,600 @@
+/**
+ * REYMASS ONE
+ * M-Pesa STK Push Controller
+ *
+ * Development version — Daraja sandbox only.
+ */
+
+const db = require('../db');
+const PaymentService = require('../services/paymentService');
+const MpesaService = require('../services/mpesaService');
+
+function response(res, status, success, message, data = undefined) {
+  const body = { success, message };
+
+  if (data !== undefined) {
+    body.data = data;
+  }
+
+   res.status(status).json(body);
+}
+
+function getCallbackItems(callback) {
+  const items = callback?.Body?.stkCallback?.CallbackMetadata?.Item;
+
+  return Array.isArray(items) ? items : [];
+}
+
+function getCallbackValue(items, name) {
+  return items.find((item) => item.Name === name)?.Value;
+}
+
+/**
+ * POST /api/v1/mpesa/stk-push
+ *
+ * Expected body:
+ * {
+ *   "invoiceId": 1,
+ *   "amount": 100,
+ *   "phoneNumber": "0712345678"
+ * }
+ *
+ * phoneNumber is optional; the customer's registered phone is used
+ * when it is omitted.
+ */
+async function initiateStkPush(req, res) {
+  let requestId = null;
+
+  try {
+    const { invoiceId, amount, phoneNumber } = req.body || {};
+
+    const numericInvoiceId = Number(invoiceId);
+
+    if (
+      !Number.isSafeInteger(numericInvoiceId) ||
+      numericInvoiceId <= 0
+    ) {
+      return response(res, 400, false, 'A valid invoice ID is required.');
+    }
+
+    const paymentAmount = MpesaService.validateAmount(amount);
+
+    const invoice = await db('invoices')
+      .where({ id: numericInvoiceId })
+      .first();
+
+    if (!invoice) {
+      return response(res, 404, false, 'Invoice not found.');
+    }
+
+    if (invoice.status === 'PAID' || invoice.status === 'CANCELLED') {
+      return response(
+        res,
+        400,
+        false,
+        'This invoice cannot accept another payment.'
+      );
+    }
+
+    const balance = Number(invoice.balance_due);
+
+    if (!Number.isFinite(balance) || balance <= 0) {
+      return response(
+        res,
+        400,
+        false,
+        'This invoice has no valid outstanding balance.'
+      );
+    }
+
+    if (paymentAmount > balance) {
+      return response(
+        res,
+        400,
+        false,
+        `Amount exceeds the outstanding balance of KES ${balance.toFixed(2)}.`
+      );
+    }
+
+    // Daraja STK Push accepts whole-shilling amounts.
+    // This controller uses the registered customer phone by default.
+    const customer = await db('customers')
+      .where({ id: invoice.customer_id })
+      .first();
+
+    if (!customer) {
+      return response(res, 404, false, 'Invoice customer not found.');
+    }
+
+    const rawPhone = phoneNumber || customer.phone;
+    const normalizedPhone = MpesaService.normalizeKenyanPhone(rawPhone);
+
+    const accountReference = `INV${invoice.id}`;
+
+    // Record the attempt before calling Safaricom.
+    const inserted = await db('mpesa_stk_requests').insert({
+      invoice_id: invoice.id,
+      customer_id: invoice.customer_id,
+      phone_number: normalizedPhone,
+      amount: paymentAmount,
+      account_reference: accountReference,
+      status: 'PENDING',
+      created_at: db.fn.now(),
+      updated_at: db.fn.now()
+    });
+
+    requestId = Array.isArray(inserted) ? inserted[0] : inserted;
+
+    if (!requestId) {
+      throw new Error('Could not create the M-Pesa request record.');
+    }
+
+    let stkResult;
+
+    try {
+      stkResult = await MpesaService.initiateStkPush({
+        phoneNumber: normalizedPhone,
+        amount: paymentAmount,
+        accountReference,
+        transactionDesc: 'REYMASS'
+      });
+       } catch (error) {
+      const outcomeUnknown = error.outcomeUnknown === true;
+
+      await db('mpesa_stk_requests')
+        .where({ id: requestId, status: 'PENDING' })
+        .update({
+          status: outcomeUnknown
+            ? 'RECONCILIATION_REQUIRED'
+            : 'FAILED',
+          result_description: error.message,
+          updated_at: db.fn.now()
+        });
+
+      if (outcomeUnknown) {
+        return response(
+          res,
+          202,
+          true,
+          'The M-Pesa request outcome is uncertain. Do not retry yet; check the request status first.',
+          {
+            requestId,
+            invoiceId: invoice.id,
+            amount: paymentAmount,
+            phoneNumber: normalizedPhone,
+            status: 'RECONCILIATION_REQUIRED'
+          }
+        );
+      }
+
+      throw error;
+    }
+
+    await db('mpesa_stk_requests')
+      .where({ id: requestId })
+      .update({
+        merchant_request_id: stkResult.merchantRequestId,
+        checkout_request_id: stkResult.checkoutRequestId,
+        updated_at: db.fn.now()
+      });
+
+    return response(
+      res,
+      202,
+      true,
+      'STK Push request accepted. Await the payment result.',
+      {
+        requestId,
+        invoiceId: invoice.id,
+        amount: paymentAmount,
+        phoneNumber: normalizedPhone,
+        checkoutRequestId: stkResult.checkoutRequestId,
+        merchantRequestId: stkResult.merchantRequestId,
+        status: 'PENDING'
+      }
+    );
+  } catch (error) {
+    console.error('M-Pesa STK initiation error:', error.message);
+
+    return response(
+      res,
+      400,
+      false,
+      error.message || 'Could not initiate the M-Pesa request.'
+    );
+  }
+}
+
+/**
+ * POST /api/v1/mpesa/callback
+ *
+ * This public endpoint receives Safaricom callback data.
+ *
+ * Important: matching callback fields alone does not cryptographically
+ * prove that Safaricom sent the callback. Sandbox development only.
+ */
+async function handleCallback(req, res) {
+  const body = req.body;
+  const callback = body?.Body?.stkCallback;
+
+  if (
+    !callback ||
+    !callback.CheckoutRequestID ||
+    callback.ResultCode === undefined
+  ) {
+    console.warn('M-Pesa callback structure validation failed:', {
+      contentType: req.get('content-type'),
+      bodyIsObject: body !== null && typeof body === 'object',
+      bodyKeys:
+        body && typeof body === 'object'
+          ? Object.keys(body)
+          : [],
+      hasBody: Boolean(body),
+      hasStkCallback: Boolean(body?.Body?.stkCallback),
+      hasCheckoutRequestId: Boolean(callback?.CheckoutRequestID),
+      hasResultCode: callback?.ResultCode !== undefined
+    });
+
+    return response(res, 400, false, 'Invalid STK callback structure.');
+  }
+
+  let request;
+
+  try {
+    request = await db('mpesa_stk_requests')
+      .where({ checkout_request_id: callback.CheckoutRequestID })
+      .first();
+
+    if (!request) {
+      console.warn(
+        'M-Pesa callback received for an unknown checkout request.'
+      );
+
+      // Acknowledge the callback without changing any invoice or payment.
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Callback received; request not matched.'
+      });
+    }
+
+    if (
+      request.merchant_request_id &&
+      callback.MerchantRequestID &&
+      request.merchant_request_id !== callback.MerchantRequestID
+    ) {
+      console.warn('M-Pesa callback merchant request ID mismatch.');
+
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Callback received; request identifiers did not match.'
+      });
+    }
+
+    // Idempotency: completed or already claimed requests must not
+    // create another payment or receipt.
+    if (request.status === 'SUCCESS') {
+  return res.status(200).json({
+    ResultCode: 0,
+    ResultDesc: 'Duplicate callback acknowledged.'
+  });
+}
+
+
+
+const isReconciliationRetry =
+  request.status === 'RECONCILIATION_REQUIRED';
+
+const isAlreadyProcessing =
+  request.status === 'PROCESSING';
+
+if (
+  request.status !== 'PENDING' &&
+  !isReconciliationRetry &&
+  !isAlreadyProcessing
+) {
+  return res.status(200).json({
+    ResultCode: 0,
+    ResultDesc: 'Request is no longer pending.'
+  });
+}
+
+    const resultCode = Number(callback.ResultCode);
+    const callbackDescription = String(
+      callback.ResultDesc || 'No result description supplied.'
+    );
+
+    // Failed/cancelled callbacks never create payments or receipts.
+if (resultCode !== 0) {
+  const cancelled = resultCode === 1032;
+
+  const allowedFailureStatuses = cancelled
+    ? ['PENDING', 'RECONCILIATION_REQUIRED']
+    : ['PENDING'];
+
+  await db('mpesa_stk_requests')
+    .where({ id: request.id })
+    .whereIn('status', allowedFailureStatuses)
+    .update({
+      status: cancelled ? 'CANCELLED' : 'FAILED',
+      result_code: String(resultCode),
+      result_description: callbackDescription,
+      callback_received_at: db.fn.now(),
+      updated_at: db.fn.now()
+    });
+
+  return res.status(200).json({
+    ResultCode: 0,
+    ResultDesc: cancelled
+      ? 'Cancellation result recorded.'
+      : 'Failed payment result recorded.'
+  });
+}
+
+    const items = getCallbackItems(req.body);
+
+    const callbackAmount = Number(getCallbackValue(items, 'Amount'));
+    const receiptNumber = getCallbackValue(items, 'MpesaReceiptNumber');
+    const callbackPhone = getCallbackValue(items, 'PhoneNumber');
+
+    if (
+      !Number.isSafeInteger(callbackAmount) ||
+      callbackAmount <= 0 ||
+      !receiptNumber ||
+      callbackPhone === undefined
+    ) {
+      await db('mpesa_stk_requests')
+        .where({ id: request.id, status: 'PENDING' })
+        .update({
+          status: 'FAILED',
+          result_code: String(resultCode),
+          result_description: 'Success callback was missing required payment metadata.',
+          callback_received_at: db.fn.now(),
+          updated_at: db.fn.now()
+        });
+
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Callback received; payment metadata requires reconciliation.'
+      });
+    }
+
+    const normalizedCallbackPhone =
+  MpesaService.normalizeKenyanPhone(callbackPhone);
+
+const normalizedRequestPhone =
+  MpesaService.normalizeKenyanPhone(request.phone_number);
+
+if (
+  callbackAmount !== Number(request.amount) ||
+  normalizedCallbackPhone !== normalizedRequestPhone
+) {
+      await db('mpesa_stk_requests')
+        .where({ id: request.id, status: 'PENDING' })
+        .update({
+          status: 'FAILED',
+          result_code: String(resultCode),
+          result_description: 'Callback amount or phone did not match the original request.',
+          callback_received_at: db.fn.now(),
+          updated_at: db.fn.now()
+        });
+
+      console.warn('M-Pesa callback amount/phone mismatch.');
+
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Callback received; payment requires reconciliation.'
+      });
+    }
+
+    /*
+     * Recover an existing payment before attempting to record one.
+     * A matching completed payment must never be recorded twice.
+     */
+    const existingPayment = await db('payments')
+      .where({ provider_reference: String(receiptNumber) })
+      .first();
+
+    if (existingPayment) {
+     const paymentInvoice = await db('invoices')
+  .where({ id: existingPayment.invoice_id })
+  .first();
+
+const requestedInvoice = await db('invoices')
+  .where({ id: request.invoice_id })
+  .first();
+
+const paymentMatches =
+  Boolean(paymentInvoice) &&
+  Boolean(requestedInvoice) &&
+
+  // The payment must belong to the requested invoice.
+  Number(existingPayment.invoice_id) === Number(request.invoice_id) &&
+
+  // The payment, request, and invoice must agree on customer.
+  Number(existingPayment.customer_id) === Number(request.customer_id) &&
+  Number(existingPayment.customer_id) === Number(paymentInvoice.customer_id) &&
+  Number(requestedInvoice.customer_id) === Number(request.customer_id) &&
+
+  // The payment and invoice must belong to the same subsidiary.
+  Number(existingPayment.subsidiary_id) ===
+    Number(paymentInvoice.subsidiary_id) &&
+  Number(requestedInvoice.subsidiary_id) ===
+    Number(paymentInvoice.subsidiary_id) &&
+
+  // The callback must agree with the recorded payment.
+  Math.round(Number(existingPayment.amount) * 100) ===
+    Math.round(callbackAmount * 100) &&
+  String(existingPayment.payment_method).toUpperCase() === 'MPESA_STK' &&
+  String(existingPayment.status).toUpperCase() === 'COMPLETED';
+      if (!paymentMatches) {
+        await db('mpesa_stk_requests')
+          .where({ id: request.id })
+          .update({
+            status: 'RECONCILIATION_REQUIRED',
+            result_description:
+              'Existing payment conflicts with callback details; manual reconciliation required.',
+            updated_at: db.fn.now()
+          });
+
+        return res.status(200).json({
+          ResultCode: 0,
+          ResultDesc: 'Payment requires reconciliation.'
+        });
+      }
+  // Verify that the existing payment has a matching receipt
+  // before declaring callback reconciliation successful.
+  const existingReceipt = await db('receipts')
+    .where({ payment_id: existingPayment.id })
+    .first();
+
+  const invoice = paymentInvoice;
+  const receiptMatches =
+    existingReceipt &&
+    invoice &&
+    Number(existingReceipt.customer_id) === Number(invoice.customer_id) &&
+    Math.round(Number(existingReceipt.amount_paid) * 100) ===
+      Math.round(Number(existingPayment.amount) * 100);
+
+  if (!receiptMatches) {
+    await db('mpesa_stk_requests')
+      .where({ id: request.id })
+      .update({
+        status: 'RECONCILIATION_REQUIRED',
+        result_description:
+          'Existing payment receipt is missing or inconsistent; manual reconciliation required.',
+        updated_at: db.fn.now()
+      });
+
+    return res.status(200).json({
+      ResultCode: 0,
+      ResultDesc: 'Payment requires reconciliation; receipt verification failed.'
+    });
+  }
+      await db('mpesa_stk_requests')
+        .where({ id: request.id })
+        .update({
+          status: 'SUCCESS',
+          result_code: String(resultCode),
+          result_description: callbackDescription,
+          mpesa_receipt_number: String(receiptNumber),
+          callback_received_at: db.fn.now(),
+          updated_at: db.fn.now()
+        });
+
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Existing payment reconciled; duplicate not recorded.'
+      });
+    }
+
+    /*
+     * A request already being processed must not start a second
+     * payment-recording attempt. Investigate uncertain outcomes separately.
+     */
+    if (request.status === 'PROCESSING') {
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc:
+          'Request is already processing; reconciliation may be required.'
+      });
+    }
+
+    /*
+     * Atomically claim the request before recording a new payment.
+     */
+    const claimQuery = db('mpesa_stk_requests')
+      .where({ id: request.id })
+      .whereIn('status', [
+        'PENDING',
+        'RECONCILIATION_REQUIRED'
+      ]);
+
+    const claimed = await claimQuery.update({
+      status: 'PROCESSING',
+      result_code: String(resultCode),
+      result_description: callbackDescription,
+      mpesa_receipt_number: String(receiptNumber),
+      callback_received_at: db.fn.now(),
+      updated_at: db.fn.now()
+    });
+
+    if (claimed !== 1) {
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Duplicate or concurrent callback acknowledged.'
+      });
+    }
+    try {
+      await PaymentService.recordPayment({
+        invoiceId: request.invoice_id,
+        amount: callbackAmount,
+        paymentMethod: 'MPESA_STK',
+        transactionRef: String(receiptNumber)
+      });
+
+      await db('mpesa_stk_requests')
+        .where({ id: request.id })
+        .update({
+          status: 'SUCCESS',
+          result_code: String(resultCode),
+          result_description: callbackDescription,
+          updated_at: db.fn.now()
+        });
+
+      return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Payment processed.'
+      });
+      } catch (paymentError) {
+      /*
+       * The provider reported success, but local payment recording failed.
+       * The customer may already have paid, so flag this for reconciliation.
+       */
+      try {
+        await db('mpesa_stk_requests')
+          .where({ id: request.id })
+          .update({
+            status: 'RECONCILIATION_REQUIRED',
+            result_description:
+              'Provider reported success, but local payment recording failed. Manual reconciliation required.',
+            updated_at: db.fn.now()
+          });
+      } catch (statusError) {
+        console.error(
+          'Could not update M-Pesa reconciliation status:',
+          {
+            requestId: request.id,
+            error: statusError.message
+          }
+        );
+      }
+
+      console.error(
+        'M-Pesa payment requires reconciliation:',
+        {
+          requestId: request.id,
+          invoiceId: request.invoice_id,
+          receiptNumber,
+          error: paymentError.message
+        }
+      );
+
+           return res.status(200).json({
+        ResultCode: 0,
+        ResultDesc: 'Callback received; payment requires reconciliation.'
+      });
+    }
+  } catch (error) {
+    console.error('M-Pesa callback processing error:', error.message);
+
+    return res.status(200).json({
+      ResultCode: 0,
+      ResultDesc: 'Callback received; processing requires investigation.'
+    });
+  }
+}
+
+module.exports = {
+  initiateStkPush,
+  handleCallback
+};

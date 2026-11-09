@@ -1,0 +1,17 @@
+const express = require('express');
+const router = express.Router();
+const workOrderController = require('../controllers/workOrderController');
+const authMiddleware = require('../middleware/authMiddleware');
+
+const authenticate = 
+  typeof authMiddleware === 'function' 
+    ? authMiddleware 
+    : (authMiddleware.authenticateToken || authMiddleware.protect || ((req, res, next) => next()));
+
+// Specific sub-routes MUST be declared before general or root routes
+router.post('/allocate-material', authenticate, workOrderController.allocateMaterialToWorkOrder);
+
+router.post('/', authenticate, workOrderController.createWorkOrder);
+router.get('/', authenticate, workOrderController.getWorkOrders);
+
+module.exports = router;

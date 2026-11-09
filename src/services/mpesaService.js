@@ -1,0 +1,369 @@
+/**
+ * REYMASS ONE
+ * Safaricom Daraja M-Pesa Sandbox Service
+ *
+ * Sandbox only. Never use production credentials with this configuration.
+ */
+
+const DARAJA_BASE_URL = 'https://sandbox.safaricom.co.ke';
+
+function getConfig() {
+  const config = {
+    environment: process.env.MPESA_ENV,
+    consumerKey: process.env.MPESA_CONSUMER_KEY,
+    consumerSecret: process.env.MPESA_CONSUMER_SECRET,
+    shortcode: process.env.MPESA_SHORTCODE,
+    passkey: process.env.MPESA_PASSKEY,
+    callbackUrl: process.env.MPESA_CALLBACK_URL
+  };
+
+  if (config.environment !== 'sandbox') {
+    throw new Error('M-Pesa service is restricted to sandbox mode.');
+  }
+
+  const required = [
+    'consumerKey',
+    'consumerSecret',
+    'shortcode',
+    'passkey',
+    'callbackUrl'
+  ];
+
+  for (const key of required) {
+    if (
+      !config[key] ||
+      !config[key].trim() ||
+      /YOUR_|PLACEHOLDER|CHANGE_ME/i.test(config[key])
+    ) {
+      throw new Error(`M-Pesa configuration is missing or invalid: ${key}`);
+    }
+  }
+
+  let callback;
+
+  try {
+    callback = new URL(config.callbackUrl);
+  } catch {
+    throw new Error('MPESA_CALLBACK_URL must be a valid HTTPS URL.');
+  }
+
+  if (callback.protocol !== 'https:') {
+    throw new Error('MPESA_CALLBACK_URL must use HTTPS.');
+  }
+
+  return config;
+}
+
+function normalizeKenyanPhone(phone) {
+  if (typeof phone !== 'string' && typeof phone !== 'number') {
+    throw new Error('A valid Kenyan M-Pesa phone number is required.');
+  }
+
+  let value = String(phone).trim().replace(/[\s()-]/g, '');
+
+  if (value.startsWith('+')) {
+    value = value.slice(1);
+  }
+
+  if (/^0[17]\d{8}$/.test(value)) {
+    value = `254${value.slice(1)}`;
+  }
+
+  if (!/^254[17]\d{8}$/.test(value)) {
+    throw new Error(
+      'Invalid Kenyan phone number. Use 07XXXXXXXX, 01XXXXXXXX, or 254XXXXXXXXX.'
+    );
+  }
+
+  return value;
+}
+
+function validateAmount(amount) {
+  const value = Number(amount);
+
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(
+      'M-Pesa STK Push amount must be a positive whole number of Kenyan shillings.'
+    );
+  }
+
+  return value;
+}
+
+function getTimestamp() {
+  // Use East Africa Time (UTC+3), independent of the computer timezone.
+  const now = new Date(Date.now() + 3 * 60 * 60 * 1000);
+
+  return now.toISOString().slice(0, 19).replace(/[-T:]/g, '');
+}
+
+async function getAccessToken() {
+  const config = getConfig();
+
+  const credentials = Buffer.from(
+    `${config.consumerKey}:${config.consumerSecret}`
+  ).toString('base64');
+
+  const response = await fetch(
+    `${DARAJA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        Accept: 'application/json'
+      },
+      signal: AbortSignal.timeout(15000)
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data.access_token) {
+    throw new Error(
+      `Daraja OAuth failed (HTTP ${response.status}). Check the sandbox credentials and application configuration.`
+    );
+  }
+
+  return data.access_token;
+}
+
+async function initiateStkPush({
+  phoneNumber,
+  amount,
+  accountReference,
+  transactionDesc = 'REYMASS ONE'
+}) {
+  const config = getConfig();
+  const phone = normalizeKenyanPhone(phoneNumber);
+  const paymentAmount = validateAmount(amount);
+
+  if (
+    typeof accountReference !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,12}$/.test(accountReference)
+  ) {
+    throw new Error(
+      'Account reference must contain 1-12 letters, numbers, hyphens, or underscores.'
+    );
+  }
+
+  if (
+    typeof transactionDesc !== 'string' ||
+    !transactionDesc.trim() ||
+    transactionDesc.trim().length > 13
+  ) {
+    throw new Error(
+      'Transaction description must be 1-13 characters.'
+    );
+  }
+
+  const callback = new URL(config.callbackUrl);
+
+  if (
+    /YOUR-|example-name|placeholder/i.test(callback.hostname) ||
+    callback.hostname === 'localhost'
+  ) {
+    throw new Error(
+      'Configure a real, publicly reachable HTTPS callback URL before initiating STK Push.'
+    );
+  }
+
+  const timestamp = getTimestamp();
+
+  const password = Buffer.from(
+    `${config.shortcode}${config.passkey}${timestamp}`
+  ).toString('base64');
+
+  const accessToken = await getAccessToken();
+
+  const payload = {
+    BusinessShortCode: config.shortcode,
+    Password: password,
+    Timestamp: timestamp,
+    TransactionType: 'CustomerPayBillOnline',
+    Amount: paymentAmount,
+    PartyA: phone,
+    PartyB: config.shortcode,
+    PhoneNumber: phone,
+    CallBackURL: config.callbackUrl,
+    AccountReference: accountReference,
+    TransactionDesc: transactionDesc.trim()
+  };
+  let response;
+
+  try {
+    response = await fetch(
+      `${DARAJA_BASE_URL}/mpesa/stkpush/v1/processrequest`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20000)
+      }
+    );
+  } catch (error) {
+    const uncertainError = new Error(
+      'The STK Push submission outcome is unknown. Check the request before retrying.'
+    );
+
+    uncertainError.outcomeUnknown = true;
+    uncertainError.cause = error;
+
+    throw uncertainError;
+  }
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch (error) {
+    const uncertainError = new Error(
+      'Daraja returned an unreadable STK Push response. Reconciliation is required.'
+    );
+
+    uncertainError.outcomeUnknown = true;
+    uncertainError.cause = error;
+
+    throw uncertainError;
+  }
+
+  if (!response.ok) {
+    const safeReason =
+      data.errorMessage ||
+      data.ResponseDescription ||
+      data.error ||
+      'No error details returned';
+
+    const requestError = new Error(
+      `Daraja STK Push returned HTTP ${response.status}: ${safeReason}`
+    );
+
+    // Server errors can occur after the provider has begun processing.
+    requestError.outcomeUnknown = response.status >= 500;
+
+    throw requestError;
+  }
+
+  if (data.ResponseCode !== '0') {
+    const safeReason =
+      data.errorMessage ||
+      data.ResponseDescription ||
+      data.error ||
+      'Daraja rejected the STK Push request.';
+
+    const requestError = new Error(
+      `Daraja STK Push was rejected: ${safeReason}`
+    );
+
+    requestError.outcomeUnknown = false;
+
+    throw requestError;
+  }
+
+  if (!data.CheckoutRequestID || !data.MerchantRequestID) {
+    const uncertainError = new Error(
+      'Daraja accepted the STK Push response but omitted request identifiers. Reconciliation is required.'
+    );
+
+    uncertainError.outcomeUnknown = true;
+
+    throw uncertainError;
+  }
+    
+  return {
+    merchantRequestId: data.MerchantRequestID,
+    checkoutRequestId: data.CheckoutRequestID,
+    responseCode: data.ResponseCode,
+    responseDescription: data.ResponseDescription,
+    customerMessage: data.CustomerMessage
+  };
+}
+async function queryStkPush(checkoutRequestId) {
+  const config = getConfig();
+
+  if (
+    typeof checkoutRequestId !== 'string' ||
+    !/^ws_CO_[A-Za-z0-9_-]+$/.test(checkoutRequestId)
+  ) {
+    throw new Error('A valid STK CheckoutRequestID is required.');
+  }
+
+  const timestamp = getTimestamp();
+
+  const password = Buffer.from(
+    `${config.shortcode}${config.passkey}${timestamp}`
+  ).toString('base64');
+
+  const accessToken = await getAccessToken();
+
+  const payload = {
+    BusinessShortCode: config.shortcode,
+    Password: password,
+    Timestamp: timestamp,
+    CheckoutRequestID: checkoutRequestId
+  };
+
+  const response = await fetch(
+    `${DARAJA_BASE_URL}/mpesa/stkpushquery/v1/query`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(20000)
+    }
+  );
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch (error) {
+    const queryError = new Error(
+      'Daraja returned an unreadable STK Query response. Reconciliation is required.'
+    );
+
+    queryError.cause = error;
+    throw queryError;
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Daraja STK Query failed (HTTP ${response.status}).`
+    );
+  }
+
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    Array.isArray(data) ||
+    typeof data.ResponseCode !== 'string' ||
+    typeof data.ResponseDescription !== 'string'
+  ) {
+    throw new Error(
+      'Daraja returned an invalid STK Query response. Reconciliation is required.'
+    );
+  }
+
+  return {
+    responseCode: data.ResponseCode,
+    responseDescription: data.ResponseDescription,
+    resultCode: data.ResultCode ?? null,
+    resultDescription: data.ResultDesc ?? null,
+    checkoutRequestId
+  };
+}
+
+module.exports = {
+  getAccessToken,
+  normalizeKenyanPhone,
+  validateAmount,
+  initiateStkPush,
+  queryStkPush
+};
