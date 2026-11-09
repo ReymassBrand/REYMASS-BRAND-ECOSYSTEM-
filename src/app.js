@@ -11,6 +11,7 @@ const workOrderRoutes = require('./routes/workOrderRoutes');
 const inventoryRoutes = require('./routes/inventoryRoutes');
 const analyticsRoutes = require('./routes/analyticsRoutes');
 const mpesaRoutes = require('./routes/mpesaRoutes');
+const db = require('./db');
 const app = express();
 
 // Trust Railway's reverse proxy for accurate client IP detection.
@@ -30,14 +31,32 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// 3. Health Check Endpoint
-app.get('/api/v1/health', (req, res) => {
-  res.status(200).json({
-    status: 'ONLINE',
-    system: 'REYMASS ONE - Digital Operating System',
-    company: 'REYMASS BRAND INVESTMENT LTD',
-    timestamp: new Date().toISOString()
-  });
+// 3. Database-aware Health Check Endpoint
+app.get('/api/v1/health', async (req, res) => {
+  try {
+    // Verify that the configured database is reachable.
+    await db.raw('SELECT 1');
+
+    return res.status(200).json({
+      status: 'ONLINE',
+      database: 'CONNECTED',
+      system: 'REYMASS ONE - Digital Operating System',
+      company: 'REYMASS BRAND INVESTMENT LTD',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    // Keep internal database details out of public responses.
+    console.error('Health check: database connection failed.');
+
+    return res.status(503).json({
+      status: 'DEGRADED',
+      database: 'UNAVAILABLE',
+      system: 'REYMASS ONE - Digital Operating System',
+      company: 'REYMASS BRAND INVESTMENT LTD',
+      timestamp: new Date().toISOString()
+    });
+ }
 });
 
 // 4. Mount Domain API Routes
