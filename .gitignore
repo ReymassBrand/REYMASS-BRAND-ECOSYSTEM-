@@ -1,36 +1,21 @@
-# Secrets and environment files
-.env
-.env.*
-!.env.example
-
-# Dependencies
+# Dependency directories (never upload these, they are too large)
 node_modules/
+jspm_packages/
 
-# Local databases
-*.sqlite
-*.sqlite3
-*.db
+# Environment secrets (CRITICAL: Never upload API keys, M-Pesa secrets, or DB passwords)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-# Logs and debugging output
+# Logs
+logs
 *.log
-debug-*.txt
-checkMpesaSchema.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Backups
-*.backup
-*.backup-*
-*.bak
-*.old
-
-# Editor and operating system files
-.vscode/
-.idea/
+# Operating System files
 .DS_Store
 Thumbs.db
-
-# Test and coverage output
-coverage/
-.nyc_output/
-
-# Database backups
-*_backup_*

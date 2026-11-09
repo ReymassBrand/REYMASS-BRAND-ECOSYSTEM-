@@ -1,0 +1,440 @@
+const crypto = require('crypto');
+const db = require('../db');
+
+const GLOBAL_ROLES = ['SUPER_ADMIN', 'CEO', 'FINANCE'];
+const SUBSIDIARY_ROLES = ['OPERATIONS_MANAGER', 'SALES'];
+const VALID_PRIORITIES = ['LOW', 'MEDIUM', 'HIGH', 'URGENT'];
+
+const isPositiveInteger = (value) =>
+  Number.isSafeInteger(Number(value)) && Number(value) > 0;
+
+const getInsertedId = (result) => {
+  if (Array.isArray(result)) {
+    return typeof result[0] === 'object'
+      ? result[0].id
+      : result[0];
+  }
+
+  return result;
+};
+
+const httpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
+const handleError = (error, res, next) => {
+  if (error.statusCode) {
+    return res.status(error.statusCode).json({
+      success: false,
+      message: error.message
+    });
+  }
+
+  return next(error);
+};
+
+// Generate a unique work-order reference.
+const generateWorkOrderNumber = () => {
+  const date = new Date().toISOString()
+    .replace(/[-:T.Z]/g, '')
+    .slice(0, 14);
+
+  const random = crypto.randomBytes(4).toString('hex').toUpperCase();
+
+  return `WO-${date}-${random}`;
+};
+
+// CREATE WORK ORDER
+const createWorkOrder = async (req, res, next) => {
+  try {
+    const {
+      customerId,
+      subsidiaryId,
+      title,
+      description,
+      priority,
+      assignedSpecialistId
+    } = req.body;
+
+    const role = String(req.user?.role || '').toUpperCase();
+    const userSubsidiaryId = req.user?.subsidiaryId;
+
+    if (!isPositiveInteger(customerId) || !title || !title.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid customer ID and work-order title are required.'
+      });
+    }
+
+    if (!['SUPER_ADMIN', 'OPERATIONS_MANAGER'].includes(role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to create work orders.'
+      });
+    }
+
+    let targetSubsidiaryId;
+
+    if (role === 'OPERATIONS_MANAGER') {
+      if (!isPositiveInteger(userSubsidiaryId)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account is not assigned to a subsidiary.'
+        });
+      }
+
+      if (
+        subsidiaryId &&
+        Number(subsidiaryId) !== Number(userSubsidiaryId)
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: 'You cannot create work orders for another subsidiary.'
+        });
+      }
+
+      targetSubsidiaryId = Number(userSubsidiaryId);
+    } else {
+      if (!isPositiveInteger(subsidiaryId)) {
+        return res.status(400).json({
+          success: false,
+          message: 'A valid subsidiary ID is required.'
+        });
+      }
+
+      targetSubsidiaryId = Number(subsidiaryId);
+    }
+
+    const customer = await db('customers')
+      .where({ id: Number(customerId) })
+      .first();
+
+    if (!customer || customer.status !== 'ACTIVE') {
+      return res.status(400).json({
+        success: false,
+        message: 'Customer does not exist or is inactive.'
+      });
+    }
+
+    const subsidiary = await db('subsidiaries')
+      .where({ id: targetSubsidiaryId })
+      .first();
+
+    if (!subsidiary || !subsidiary.is_active) {
+      return res.status(400).json({
+        success: false,
+        message: 'Subsidiary does not exist or is inactive.'
+      });
+    }
+
+    let specialistId = null;
+
+    if (assignedSpecialistId !== undefined &&
+        assignedSpecialistId !== null &&
+        assignedSpecialistId !== '') {
+
+      if (!isPositiveInteger(assignedSpecialistId)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid specialist ID.'
+        });
+      }
+
+      const specialist = await db('users')
+        .join('roles', 'users.role_id', 'roles.id')
+        .where('users.id', Number(assignedSpecialistId))
+        .select(
+          'users.id',
+          'users.subsidiary_id',
+          'users.is_active',
+          'roles.name as role_name'
+        )
+        .first();
+
+      if (
+        !specialist ||
+        !specialist.is_active ||
+        specialist.role_name !== 'SPECIALIST' ||
+        Number(specialist.subsidiary_id) !== targetSubsidiaryId
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: 'Specialist must be active and belong to the work-order subsidiary.'
+        });
+      }
+
+      specialistId = specialist.id;
+    }
+
+    const normalizedPriority = String(priority || 'MEDIUM')
+      .trim()
+      .toUpperCase();
+
+    if (!VALID_PRIORITIES.includes(normalizedPriority)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid work-order priority.'
+      });
+    }
+
+    const workOrderNumber = generateWorkOrderNumber();
+
+    const status = specialistId ? 'ASSIGNED' : 'PENDING';
+
+    const result = await db('work_orders')
+      .insert({
+        work_order_number: workOrderNumber,
+        customer_id: Number(customerId),
+        subsidiary_id: targetSubsidiaryId,
+        assigned_specialist_id: specialistId,
+        title: title.trim(),
+        description: description || null,
+        priority: normalizedPriority,
+        status
+      })
+      .returning('id');
+
+    const workOrderId = getInsertedId(result);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Work order created successfully.',
+      data: {
+        id: workOrderId,
+        workOrderNumber,
+        status
+      }
+    });
+
+  } catch (error) {
+    return handleError(error, res, next);
+  }
+};
+
+// GET WORK ORDERS WITH ROLE-BASED ACCESS CONTROL
+const getWorkOrders = async (req, res, next) => {
+  try {
+    const role = String(req.user?.role || '').toUpperCase();
+    const subsidiaryId = req.user?.subsidiaryId;
+    const userId = req.user?.userId;
+
+    let query = db('work_orders')
+      .join('customers', 'work_orders.customer_id', 'customers.id')
+      .join('subsidiaries', 'work_orders.subsidiary_id', 'subsidiaries.id')
+      .select(
+        'work_orders.id',
+        'work_orders.work_order_number',
+        'work_orders.title',
+        'work_orders.description',
+        'work_orders.priority',
+        'work_orders.status',
+        'work_orders.customer_id',
+        'work_orders.subsidiary_id',
+        'work_orders.assigned_specialist_id',
+        'customers.name as customer_name',
+        'subsidiaries.code as subsidiary_code'
+      );
+
+    if (GLOBAL_ROLES.includes(role)) {
+      // Global visibility.
+    } else if (SUBSIDIARY_ROLES.includes(role)) {
+
+      if (!isPositiveInteger(subsidiaryId)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account is not assigned to a subsidiary.'
+        });
+      }
+
+      query = query.where(
+        'work_orders.subsidiary_id',
+        Number(subsidiaryId)
+      );
+
+    } else if (role === 'SPECIALIST') {
+
+      if (
+        !isPositiveInteger(userId) ||
+        !isPositiveInteger(subsidiaryId)
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: 'Invalid specialist account information.'
+        });
+      }
+
+      query = query
+        .where('work_orders.subsidiary_id', Number(subsidiaryId))
+        .where('work_orders.assigned_specialist_id', Number(userId));
+
+    } else {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to view work orders.'
+      });
+    }
+
+    const orders = await query.orderBy('work_orders.id', 'desc');
+
+    return res.status(200).json({
+      success: true,
+      data: orders
+    });
+
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// ALLOCATE MATERIAL TO WORK ORDER
+const allocateMaterialToWorkOrder = async (req, res, next) => {
+  try {
+    const { workOrderId, catalogItemId, quantity } = req.body;
+
+    const role = String(req.user?.role || '').toUpperCase();
+    const userId = req.user?.userId;
+    const subsidiaryId = req.user?.subsidiaryId;
+
+    if (
+      !isPositiveInteger(workOrderId) ||
+      !isPositiveInteger(catalogItemId) ||
+      !isPositiveInteger(quantity)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid work order ID, catalog item ID and positive integer quantity are required.'
+      });
+    }
+
+    if (
+      !['SUPER_ADMIN', 'OPERATIONS_MANAGER', 'SPECIALIST'].includes(role)
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to allocate materials.'
+      });
+    }
+
+    const allocation = await db.transaction(async (trx) => {
+
+      const workOrder = await trx('work_orders')
+        .where({ id: Number(workOrderId) })
+        .first();
+
+      if (!workOrder) {
+        throw httpError(404, 'Work order not found.');
+      }
+      const workOrderStatus = String(workOrder.status || '').toUpperCase();
+
+      if (['COMPLETED', 'CANCELLED'].includes(workOrderStatus)) {
+        throw httpError(
+          400,
+          `Materials cannot be allocated to a ${workOrderStatus.toLowerCase()} work order.`
+        );
+      }
+      if (role !== 'SUPER_ADMIN') {
+
+        if (
+          !isPositiveInteger(subsidiaryId) ||
+          Number(workOrder.subsidiary_id) !== Number(subsidiaryId)
+        ) {
+          throw httpError(403, 'You cannot allocate materials to another subsidiary.');
+        }
+
+        if (
+          role === 'SPECIALIST' &&
+          Number(workOrder.assigned_specialist_id) !== Number(userId)
+        ) {
+          throw httpError(403, 'You can only allocate materials to work orders assigned to you.');
+        }
+      }
+
+      const stock = await trx('inventory_stock')
+        .join(
+          'services_catalog',
+          'inventory_stock.catalog_id',
+          'services_catalog.id'
+        )
+        .where({
+          'inventory_stock.catalog_id': Number(catalogItemId),
+          'inventory_stock.subsidiary_id': workOrder.subsidiary_id,
+          'services_catalog.item_type': 'PRODUCT',
+          'services_catalog.is_active': true
+        })
+        .select(
+          'inventory_stock.id as stock_id',
+          'inventory_stock.quantity_on_hand',
+          'inventory_stock.warehouse_location',
+          'inventory_stock.subsidiary_id',
+          'services_catalog.id as catalog_id',
+          'services_catalog.item_code',
+          'services_catalog.name as item_name'
+        )
+        .first();
+
+      if (!stock) {
+        throw httpError(400, 'Product stock not found in the work-order subsidiary.');
+      }
+
+      const requestedQuantity = Number(quantity);
+
+      if (Number(stock.quantity_on_hand) < requestedQuantity) {
+        throw httpError(
+          400,
+          `Insufficient stock. Available quantity: ${stock.quantity_on_hand}`
+        );
+      }
+
+      // Conditional deduction protects against overselling stock.
+      const updatedRows = await trx('inventory_stock')
+        .where({ id: stock.stock_id })
+        .where('quantity_on_hand', '>=', requestedQuantity)
+        .decrement('quantity_on_hand', requestedQuantity);
+
+      if (Number(updatedRows) !== 1) {
+        throw httpError(400, 'Stock changed during allocation. Please try again.');
+      }
+
+      // Record the allocation in the permanent audit history.
+      await trx('material_allocations').insert({
+        work_order_id: Number(workOrderId),
+        catalog_id: stock.catalog_id,
+        stock_id: stock.stock_id,
+        subsidiary_id: stock.subsidiary_id,
+        allocated_by_user_id: Number(userId),
+        quantity: requestedQuantity,
+        item_code: stock.item_code,
+        item_name: stock.item_name,
+        warehouse_location: stock.warehouse_location || null
+      });
+
+      const updatedStock = await trx('inventory_stock')
+        .where({ id: stock.stock_id })
+        .first();
+
+      return {
+        catalogItemId: Number(catalogItemId),
+        allocatedQuantity: requestedQuantity,
+        remainingStock: updatedStock.quantity_on_hand,
+        workOrderId: Number(workOrderId)
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Successfully allocated ${allocation.allocatedQuantity} unit(s) to work order ${allocation.workOrderId}.`,
+      data: allocation
+    });
+
+  } catch (error) {
+    return handleError(error, res, next);
+  }
+};
+
+module.exports = {
+  createWorkOrder,
+  getWorkOrders,
+  allocateMaterialToWorkOrder
+};

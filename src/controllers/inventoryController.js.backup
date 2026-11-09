@@ -1,0 +1,68 @@
+const db = require('../db');
+
+// Create item in catalog & initialize stock record
+const createCatalogItem = async (req, res, next) => {
+  try {
+    const { subsidiaryId, itemCode, name, itemType, description, unitPrice, initialStock, warehouseLocation } = req.body;
+
+    if (!subsidiaryId || !itemCode || !name || unitPrice === undefined) {
+      return res.status(400).json({ success: false, message: 'subsidiaryId, itemCode, name, and unitPrice are required.' });
+    }
+
+    const [itemId] = await db('services_catalog').insert({
+      subsidiary_id: subsidiaryId,
+      item_code: itemCode,
+      name,
+      item_type: itemType || 'PRODUCT',
+      description,
+      unit_price: unitPrice
+    }).returning('id');
+
+    const actualItemId = typeof itemId === 'object' ? itemId.id : itemId;
+
+    // If item is a product, initialize stock entry
+    if ((itemType || 'PRODUCT') === 'PRODUCT') {
+      await db('inventory_stock').insert({
+        catalog_id: actualItemId,
+        subsidiary_id: subsidiaryId,
+        quantity_on_hand: initialStock || 0,
+        warehouse_location: warehouseLocation || 'Main HQ Warehouse'
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'Catalog item created successfully.',
+      data: { id: actualItemId, itemCode, name, initialStock: initialStock || 0 }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Retrieve inventory levels with catalog details
+const getInventoryStock = async (req, res, next) => {
+  try {
+    const stock = await db('inventory_stock')
+      .join('services_catalog', 'inventory_stock.catalog_id', 'services_catalog.id')
+      .join('subsidiaries', 'inventory_stock.subsidiary_id', 'subsidiaries.id')
+      .select(
+        'inventory_stock.id as stock_id',
+        'services_catalog.item_code',
+        'services_catalog.name as item_name',
+        'services_catalog.unit_price',
+        'inventory_stock.quantity_on_hand',
+        'inventory_stock.warehouse_location',
+        'subsidiaries.code as subsidiary_code'
+      );
+
+    return res.status(200).json({ success: true, data: stock });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  createCatalogItem,
+  getInventoryStock
+};
