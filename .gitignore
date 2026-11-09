@@ -19,3 +19,10 @@ yarn-error.log*
 # Operating System files
 .DS_Store
 Thumbs.db
+# SQLite databases and backups
+*.sqlite
+*.sqlite3
+*.db
+
+# Database backup files
+database/*backup*

@@ -1,11 +1,36 @@
 const knex = require('knex');
 const knexfile = require('../knexfile');
 
-// Automatically switch to 'test' environment if running inside Jest
-const environment = process.env.NODE_ENV || (process.env.JEST_WORKER_ID ? 'test' : 'development');
-const config = knexfile[environment] || knexfile.development || knexfile;
+// Determine the application environment.
+const environment =
+  process.env.NODE_ENV ||
+  (process.env.JEST_WORKER_ID ? 'test' : 'development');
 
-// Initialize Knex instance
+// Never silently fall back to another database environment.
+if (!knexfile[environment]) {
+  throw new Error(
+    `Invalid database environment: ${environment}`
+  );
+}
+
+// Production must use PostgreSQL and a valid connection URL.
+if (environment === 'production') {
+  if (!process.env.DATABASE_URL) {
+    throw new Error(
+      'DATABASE_URL is required in production. Refusing to start.'
+    );
+  }
+
+  if (knexfile.production.client !== 'pg') {
+    throw new Error(
+      'Production database must use PostgreSQL.'
+    );
+  }
+}
+
+const config = knexfile[environment];
+
+// Initialize Knex.
 const db = knex(config);
 
 module.exports = db;
